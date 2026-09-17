@@ -1,600 +1,843 @@
 # Dockerfile Cheatsheet
 
-A comprehensive reference guide for Dockerfile instructions, best practices, and examples.
+A comprehensive reference for every Dockerfile instruction, BuildKit feature, and production best practice.
 
 ## 🔗 Navigation
 
-- **[← Back to Main Docker Cheatsheet](README.md)** - Essential Docker commands
-- **[Docker Compose Cheatsheet](docker-compose_cheatsheet.md)** - Multi-container orchestration
+- **[← Back to Main Docker Cheatsheet](README.md)** — essential Docker commands
+- **[Docker Compose Cheatsheet](docker-compose_cheatsheet.md)** — multi-container orchestration
 
 ## Table of Contents
 
 - [Introduction](#introduction)
-- [Basic Instructions](#basic-instructions)
+- [Syntax & Parser Directives](#syntax--parser-directives)
+- [Build Context & .dockerignore](#build-context--dockerignore)
+- [Core Instructions](#core-instructions)
 - [Advanced Instructions](#advanced-instructions)
+- [ENTRYPOINT vs CMD vs RUN](#entrypoint-vs-cmd-vs-run)
 - [Best Practices](#best-practices)
+- [BuildKit Features](#buildkit-features)
 - [Common Examples](#common-examples)
-- [2024-2025 Updates](#2024-2025-updates)
+- [Instruction Quick Reference](#instruction-quick-reference)
+- [Common Anti-Patterns](#common-anti-patterns)
+- [What's New (2024–2026)](#whats-new-20242026)
+- [References](#references)
 
 ## Introduction
 
-A Dockerfile is a text file that contains a series of instructions used to build Docker images automatically. It defines the environment, dependencies, and commands needed to run your application.
+A Dockerfile is a text file with a series of instructions that Docker executes to build an image. Each instruction produces a layer; layers are cached and reused, which is why **order matters** for build speed.
+
+```
+Dockerfile + build context ──▶ BuildKit ──▶ image (layers) ──▶ registry
+```
 
 ### Basic Structure
+
 ```dockerfile
 # Comment
 INSTRUCTION arguments
 ```
 
-### Dockerfile Syntax Rules
-- Instructions are case-insensitive (convention: UPPERCASE)
-- Each instruction creates a new layer
-- Instructions are executed in order
-- Comments start with `#`
-- Use `.dockerignore` to exclude unnecessary files
-- Prefer `COPY` over `ADD` for security and clarity
+### Syntax Rules
 
-## Basic Instructions
+- Instructions are case-insensitive; convention is UPPERCASE.
+- The first instruction must be `FROM` (parser directives and `ARG` may precede it).
+- Each instruction generally creates a new layer — combine related commands.
+- Comments start with `#`; a `#` elsewhere in a line is literal.
+- Line continuation with `\`; arguments can be split across lines.
+- Use `.dockerignore` to keep the build context small.
+- Prefer `COPY` over `ADD`.
 
-### FROM
-Specifies the base image for your container.
+## Syntax & Parser Directives
+
+Optional directives at the top of the file control the parser and linter:
 
 ```dockerfile
-# Use official image
-FROM node:18-alpine
+# syntax=docker/dockerfile:1
+# escape=\
+# check=error=true
 
-# Use specific version
-FROM ubuntu:20.04
-
-# Use scratch (empty image)
-FROM scratch
-
-# Multi-platform
-FROM --platform=linux/amd64 node:18
+FROM node:24-alpine
 ```
 
-### RUN
-Executes commands during image build.
+| Directive | Purpose |
+|-----------|---------|
+| `# syntax=docker/dockerfile:1` | Use the latest stable BuildKit frontend (needed for heredocs, `--mount`, `--link`, …) |
+| `# syntax=docker/dockerfile:1.7` | Pin an exact frontend version for reproducible builds |
+| `# escape=\` (or `` ` ``) | Change the line-continuation character (Windows paths) |
+| `# check=error=true` | Fail the build on linter warnings (`docker build --check`) |
+
+## Build Context & .dockerignore
+
+The **build context** is everything sent to the builder (`docker build .` → the current directory). A large context slows builds and can leak files into images.
+
+`.dockerignore` lives next to the Dockerfile:
+
+```
+**/.git
+**/.gitignore
+**/node_modules
+**/.env
+**/.env.*
+**/*.log
+**/__pycache__
+**/.venv
+**/dist
+**/coverage
+Dockerfile*
+docker-compose*.yml
+*.md
+!README.md
+```
+
+- Patterns are evaluated in order; `!` negates.
+- `**/` matches any directory depth, `*` matches within a path segment.
+- Excluding secrets (`.env`), VCS data (`.git`), and dependencies (`node_modules`) is mandatory hygiene.
+
+## Core Instructions
+
+### FROM
+
+Sets the base image; must be the first instruction of a stage.
 
 ```dockerfile
-# Single command
-RUN apt-get update
+FROM node:24-alpine                 # official image, pinned major
+FROM ubuntu:24.04                   # specific version
+FROM scratch                        # empty base — static binaries only
+FROM node:24 AS build               # named stage for multi-stage builds
+FROM --platform=linux/amd64 ubuntu:24.04
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build   # cross-compilation
+FROM node:24-alpine@sha256:<digest> # fully reproducible pin
+```
 
-# Multiple commands (creates one layer)
-RUN apt-get update && \
-    apt-get install -y curl && \
-    rm -rf /var/lib/apt/lists/*
+- `ARG` may be used in `FROM` only if declared before it:
 
-# Shell form
-RUN echo "Hello World"
+```dockerfile
+ARG NODE_VERSION=24
+FROM node:${NODE_VERSION}-alpine
+```
 
-# Exec form (no shell)
-RUN ["/bin/bash", "-c", "echo Hello World"]
+- Prefer slim/alpine/distroless/scratch bases; `latest` hurts reproducibility.
+
+### RUN
+
+Executes commands **at build time**, in a new layer.
+
+```dockerfile
+# Shell form — runs via /bin/sh -c (string interpolation works)
+RUN apt-get update && apt-get install -y --no-install-recommends curl
+
+# Exec form — no shell; use when you need no shell processing
+RUN ["/bin/bash", "-c", "set -eux; echo hello"]
+
+# Combine and clean up in the SAME layer
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Heredoc (BuildKit, frontend 1.4+)
+RUN <<EOF
+set -eux
+echo "multiple lines"
+EOF
 ```
 
 ### CMD
-Sets the default command to run when container starts.
+
+Default command for the container. Only the **last** `CMD` in a stage takes effect; overridden by any arguments passed to `docker run`.
 
 ```dockerfile
-# Shell form
-CMD echo "Hello World"
-
-# Exec form (recommended)
-CMD ["echo", "Hello World"]
-
-# Default parameters for ENTRYPOINT
-CMD ["--help"]
+CMD ["node", "server.js"]            # exec form (recommended)
+CMD node server.js                   # shell form — runs as /bin/sh -c "node server.js"
+CMD ["--help"]                       # default args for ENTRYPOINT
 ```
 
 ### ENTRYPOINT
-Sets the main command that cannot be overridden.
+
+Makes the container behave like an executable. `CMD` supplies default arguments.
 
 ```dockerfile
-# Shell form
-ENTRYPOINT echo "Hello"
-
-# Exec form (recommended)
-ENTRYPOINT ["echo", "Hello"]
-
-# With CMD as parameters
-ENTRYPOINT ["echo"]
-CMD ["Hello World"]
+ENTRYPOINT ["node", "server.js"]     # exec form (recommended)
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["nginx", "-g", "daemon off;"]   # args appended to ENTRYPOINT
 ```
 
-### COPY vs ADD
-Copy files from host to container.
+Override at runtime with `docker run --entrypoint sh <image>`.
+
+### COPY
+
+Copies files from the build context (or another stage) into the image.
 
 ```dockerfile
-# COPY (recommended for simple file copying)
-COPY package.json /app/
+COPY package.json package-lock.json ./      # relative to WORKDIR
 COPY . /app/
-
-# COPY with multiple sources
-COPY package*.json ./
-
-# ADD (has additional features)
-ADD package.json /app/
-ADD https://example.com/file.tar.gz /tmp/
-
-# ADD with extraction
-ADD archive.tar.gz /app/
+COPY --chown=1000:1000 app /app             # set ownership without a chown layer
+COPY --from=build /app/dist ./dist          # copy from a named stage
+COPY --from=nginx:1.28-alpine /etc/nginx/nginx.conf /etc/nginx/
+COPY --link --chown=1000:1000 . /app        # independent layer, cache friendly (BuildKit 1.4+)
+COPY --exclude=*.log --exclude=node_modules . /app   # frontend 1.19+
 ```
+
+- Destination ending in `/` (or `.`/`..`) = directory; otherwise treated as a file for a single source.
+- `COPY` never extracts archives and never accesses the network.
+
+### ADD
+
+Like `COPY`, with two extra behaviors — and two good reasons to prefer `COPY`.
+
+```dockerfile
+ADD app.tar.gz /app/                 # AUTO-EXTRACTS local tar archives
+ADD https://example.com/file.tar.gz /tmp/   # downloads BUT does not extract
+```
+
+- Remote `ADD` cannot be cached well and provides no checksum verification — use `RUN curl -fsSL … | tar …` instead.
+- Use `ADD` deliberately (e.g. unpacking a trusted local tarball); otherwise `COPY`.
 
 ### WORKDIR
-Sets the working directory for subsequent instructions.
+
+Sets the working directory for `RUN`, `CMD`, `ENTRYPOINT`, `COPY`, and `ADD`. Creates the directory if missing.
 
 ```dockerfile
-# Set working directory
 WORKDIR /app
-
-# Multiple WORKDIR instructions
-WORKDIR /app
-WORKDIR src
-# Final directory: /app/src
+WORKDIR src            # relative → /app/src
+WORKDIR /var/www/html  # absolute resets
 ```
+
+Avoid `RUN cd /app` — it does not persist.
 
 ### ENV
-Sets environment variables.
+
+Sets environment variables that persist in the image and in every container.
 
 ```dockerfile
-# Single variable
 ENV NODE_ENV=production
-
-# Multiple variables
-ENV NODE_ENV=production \
-    PORT=3000
-
-# Using variables
-ENV NODE_ENV=production
-ENV APP_HOME=/app
-WORKDIR $APP_HOME
+ENV APP_HOME=/app PORT=3000         # multiple in one layer
+ENV PATH="$APP_HOME/bin:$PATH"      # expand previous variables
 ```
+
+`ENV` values are visible in `docker inspect` — never put secrets here.
+
+### ARG
+
+Build-time variables, not persisted in the final image runtime environment.
+
+```dockerfile
+ARG NODE_VERSION=24                 # before FROM: usable in FROM line only
+FROM node:${NODE_VERSION}-alpine
+ARG NODE_VERSION                    # redeclare to use inside the stage
+RUN echo "$NODE_VERSION"
+
+ARG BUILD_DATE
+LABEL org.opencontainers.image.created=$BUILD_DATE
+```
+
+```bash
+docker build --build-arg NODE_VERSION=22 .
+```
+
+- `ARG` values **are** recorded in image history — never pass secrets as build args.
+- `ARG` scope is per stage; redeclare after each `FROM`.
+- A same-named `ENV` overrides `ARG`.
 
 ### EXPOSE
-Documents which ports the container listens on.
+
+Documents the ports the container listens on (metadata only — it does not publish anything).
 
 ```dockerfile
-# Single port
 EXPOSE 3000
-
-# Multiple ports
-EXPOSE 3000 8080
-
-# With protocol
-EXPOSE 3000/tcp
-EXPOSE 8080/udp
+EXPOSE 80/tcp 53/udp
 ```
+
+Publish with `docker run -p 8080:80` or Compose `ports:`.
 
 ## Advanced Instructions
 
-### ARG
-Defines build-time variables.
-
-```dockerfile
-# Define build argument
-ARG NODE_VERSION=18
-FROM node:${NODE_VERSION}-alpine
-
-# Use in build
-ARG BUILD_DATE
-LABEL build-date=$BUILD_DATE
-
-# Build with: docker build --build-arg NODE_VERSION=16 .
-```
-
-### LABEL
-Adds metadata to the image.
-
-```dockerfile
-# Single label
-LABEL version="1.0"
-
-# Multiple labels
-LABEL version="1.0" \
-      author="John Doe" \
-      description="My application"
-
-# Using variables
-ARG VERSION=1.0
-LABEL version=$VERSION
-```
-
 ### USER
-Sets the user for subsequent instructions.
+
+Sets the user (and optional group) for subsequent instructions and the container runtime.
 
 ```dockerfile
-# Create user
-RUN adduser -D appuser
-USER appuser
+# Alpine
+RUN addgroup -S -g 1001 app && adduser -S -u 1001 -G app app
+USER app
 
-# Use specific user
-USER 1000
+# Debian / Ubuntu
+RUN groupadd --system --gid 1001 app \
+ && useradd --system --uid 1001 --gid app --create-home app
+USER app
 
-# Switch back to root
-USER root
+USER 1001:1001                      # numeric (works with any base image)
+USER root                           # switch back when needed
 ```
+
+`COPY --chown` should be used instead of `RUN chown -R` (avoids duplicating a whole tree in a layer).
 
 ### VOLUME
-Creates mount points for external volumes.
+
+Declares a mount point backed by a Docker-managed volume.
 
 ```dockerfile
-# Single volume
 VOLUME ["/data"]
-
-# Multiple volumes
-VOLUME ["/data", "/logs"]
-
-# With specific mount point
 VOLUME /var/lib/mysql
 ```
 
-### HEALTHCHECK
-Defines how to check if container is healthy.
+Caveats:
+
+- Documented behavior: changes made to a `VOLUME` path **after** the instruction are discarded at runtime — so `VOLUME /app` swallows later writes.
+- Use it to declare a data boundary (databases), not to seed data; prefer mounting volumes via `docker run`/Compose.
+- Anonymous volumes created by `VOLUME` live on after `docker rm` unless removed with `-v`.
+
+### LABEL
+
+Adds image metadata. Prefer the standard [OCI keys](https://github.com/opencontainers/image-spec/blob/main/annotations.md).
 
 ```dockerfile
-# Basic health check
-HEALTHCHECK CMD curl -f http://localhost:3000/health || exit 1
-
-# With options
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
-
-# Disable health check
-HEALTHCHECK NONE
+LABEL org.opencontainers.image.title="myapp" \
+      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.source="https://github.com/org/repo" \
+      org.opencontainers.image.revision=$GIT_SHA \
+      org.opencontainers.image.licenses="MIT"
 ```
 
-### SHELL
-Overrides the default shell.
+`MAINTAINER` is deprecated — use `org.opencontainers.image.authors`.
+
+### HEALTHCHECK
+
+Tells Docker how to test whether the container is still working.
 
 ```dockerfile
-# Use PowerShell on Windows
-SHELL ["powershell", "-command"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --start-interval=2s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:3000/health || exit 1
 
-# Use bash
-SHELL ["/bin/bash", "-c"]
+HEALTHCHECK CMD ["node", "healthcheck.js"]    # exec form, no shell
+HEALTHCHECK NONE                              # disable inherited check
+```
+
+| Option | Meaning |
+|--------|---------|
+| `--interval` | Time between checks (default 30s) |
+| `--timeout` | Max duration of a single check (default 30s) |
+| `--retries` | Consecutive failures before `unhealthy` (default 3) |
+| `--start-period` | Grace period during startup (default 0s) |
+| `--start-interval` | Check interval during `--start-period` (Docker 25+) |
+
+Use tools that exist in the image (`wget` in Alpine, Python `urllib` in slim images); avoid installing `curl` just for the check.
+
+### SHELL
+
+Changes the shell used by the shell form of `RUN`, `CMD`, and `ENTRYPOINT`.
+
+```dockerfile
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]   # fail on broken pipes
+SHELL ["powershell", "-Command"]              # Windows containers
+```
+
+### STOPSIGNAL
+
+Signal sent by `docker stop` (after which the container is killed).
+
+```dockerfile
+STOPSIGNAL SIGQUIT     # e.g. nginx graceful shutdown
+STOPSIGNAL SIGTERM     # default
 ```
 
 ### ONBUILD
-Triggers instructions when the image is used as base.
+
+Registers a trigger that runs in **child** builds (images built `FROM` this one).
 
 ```dockerfile
-# Trigger when used as base image
 ONBUILD COPY package.json ./
 ONBUILD RUN npm install
 ONBUILD COPY . ./
 ```
 
+- Triggers run during the child's build and are not inherited by grandchildren.
+- They run with the child's context/permissions — surprising and hard to debug. Modern practice: prefer explicit multi-stage builds or build args.
+
+## ENTRYPOINT vs CMD vs RUN
+
+| Instruction | When it runs | Override |
+|-------------|--------------|----------|
+| `RUN` | Build time (creates a layer) | Rebuild |
+| `CMD` | Container start (default command/args) | `docker run <image> <args>` replaces it |
+| `ENTRYPOINT` | Container start (fixed executable) | `docker run --entrypoint <cmd>` |
+
+Common patterns:
+
+```dockerfile
+# Executable with default args
+ENTRYPOINT ["nginx"]
+CMD ["-g", "daemon off;"]
+
+# Script that forwards signals — use exec "$@"
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["postgres"]
+```
+
+```bash
+#!/bin/sh
+set -e
+# ... init ...
+exec "$@"        # replace the shell so PID 1 receives signals
+```
+
+Rules of thumb:
+
+- Use **exec form** (`["cmd", "arg"]`) so your process is PID 1 and receives signals — shell form runs `/bin/sh -c` and may swallow `SIGTERM`.
+- If PID 1 cannot reap zombies, run with `docker run --init` or Compose `init: true`.
+
 ## Best Practices
 
-### Multi-stage Builds
-Reduce final image size by using multiple stages.
+### 1. Multi-stage Builds
+
+Build with the full toolchain; ship only the artifact.
 
 ```dockerfile
-# Build stage
-FROM node:18 AS builder
+# syntax=docker/dockerfile:1
+
+FROM node:24-alpine AS build
 WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production
-
-# Production stage
-FROM node:18-alpine
-WORKDIR /app
-COPY --from=builder /app/node_modules ./node_modules
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
 COPY . .
-CMD ["npm", "start"]
+RUN npm run build
+
+FROM nginx:1.28-alpine
+COPY --from=build /app/dist /usr/share/nginx/html
 ```
 
-### Layer Optimization
-Minimize layers and optimize caching.
+Also useful for running tests in CI without shipping test dependencies:
 
 ```dockerfile
-# Bad: Multiple RUN commands
-RUN apt-get update
-RUN apt-get install -y curl
-RUN apt-get install -y git
+FROM build AS test
+RUN npm test
 
-# Good: Single RUN command
-RUN apt-get update && \
-    apt-get install -y curl git && \
-    rm -rf /var/lib/apt/lists/*
-
-# Copy package files first for better caching
-COPY package*.json ./
-RUN npm install
-COPY . .
+FROM nginx:1.28-alpine AS runtime
+COPY --from=build /app/dist /usr/share/nginx/html
 ```
 
-### Security Considerations
+### 2. Layer Caching Order
+
+Order instructions from **least** to **most** frequently changed:
 
 ```dockerfile
-# Use specific versions
-FROM node:18.17.0-alpine
-
-# Don't run as root
-RUN adduser -D appuser
-USER appuser
-
-# Use .dockerignore
-# Don't copy sensitive files
+# Good: dependencies cached until lockfile changes
+COPY package.json package-lock.json ./
+RUN npm ci
 COPY . .
-# Remove sensitive files
-RUN rm -f .env.secret
+
+# Bad: any source change re-installs dependencies
+COPY . .
+RUN npm ci
 ```
 
-### Image Size Optimization
+Also:
+
+- `apt-get update` and `apt-get install` must be in the **same** `RUN`.
+- Combine multiple shell commands to reduce layers (each `RUN` is a layer).
+- Use `--mount=type=cache` (BuildKit) rather than relying on layer caching for package managers.
+
+### 3. Image Size
 
 ```dockerfile
-# Use alpine variants
-FROM node:18-alpine
+# Pick a minimal base that satisfies your needs
+FROM node:24-alpine        # or node:24-slim / distroless / scratch
 
-# Remove package manager cache
-RUN apt-get update && \
-    apt-get install -y curl && \
-    rm -rf /var/lib/apt/lists/*
+# Clean package manager data in the same layer
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
 
-# Use multi-stage builds
-FROM node:18 AS builder
-# ... build steps
-FROM node:18-alpine
-COPY --from=builder /app/dist ./dist
+# Python
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Node
+RUN npm ci --omit=dev      # skip devDependencies
+
+# Go: static binary, no libc needed
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app .
+```
+
+- `--no-install-recommends` avoids extra apt packages.
+- Don't run `apt-get upgrade` in images (unpredictable, bloats layers).
+- Strip binaries (`-s -w` in Go, `strip` for C/C++).
+
+### 4. Security
+
+```dockerfile
+# Pin versions/digests, not latest
+FROM node:24-alpine@sha256:<digest>
+
+# Run as non-root
+RUN addgroup -S -g 1001 app && adduser -S -u 1001 -G app app
+USER app
+
+# Never bake secrets — mount them for the build instead
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci
+
+# Install only what you need; remove package managers if possible
+```
+
+- Secrets in `ENV`, `ARG`, or `COPY` remain in layer history — always rotatable, never private.
+- Use `docker scout cves <image>` / `trivy image <image>` in CI.
+- Add `--security-opt no-new-privileges` and `--read-only` at **runtime** where possible.
+- Keep the base image updated; rebuild regularly (e.g. Renovate/Dependabot for base tags).
+
+### 5. `.dockerignore` and Context
+
+Small context = fast builds, no accidental secret copies:
+
+```
+**/.git
+**/node_modules
+**/.env*
+**/*.log
+**/dist
+```
+
+### 6. Reproducibility
+
+- `# syntax=docker/dockerfile:1.7` (pinned frontend).
+- `npm ci` / `pip install -r` / `go mod download` from lockfiles.
+- Pin base images by digest for critical builds.
+- `SOURCE_DATE_EPOCH` and `--provenance=true` for verifiable builds.
+
+## BuildKit Features
+
+BuildKit is the default builder (Docker 23+). These features require `# syntax=docker/dockerfile:1` (or newer). See [Building with BuildKit](https://docs.docker.com/build/buildkit/).
+
+### Cache Mounts
+
+Persist package-manager caches **outside** the image layer.
+
+```dockerfile
+RUN --mount=type=cache,target=/root/.npm npm ci
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -y curl
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -o /out/app .
+```
+
+- Cache contents are not part of the image.
+- Add `sharing=locked` when parallel builds share a cache (`apt`).
+- The cache survives rebuilds; clear it with `docker builder prune`.
+
+### Secrets
+
+```dockerfile
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci
+RUN --mount=type=secret,id=aws,required=false test -f /run/secrets/aws
+```
+
+```bash
+docker build --secret id=npmrc,src=$HOME/.npmrc -t app .
+docker build --secret id=aws,src=$HOME/.aws/credentials -t app .
+```
+
+With Compose:
+
+```yaml
+services:
+  app:
+    build:
+      context: .
+      secrets:
+        - npmrc
+secrets:
+  npmrc:
+    file: $HOME/.npmrc
+```
+
+### SSH Agent Forwarding
+
+```dockerfile
+RUN --mount=type=ssh git clone git@github.com:org/private-repo.git
+```
+
+```bash
+docker build --ssh default -t app .
+```
+
+### Multi-Platform Builds
+
+Automatic platform arguments: `BUILDPLATFORM`, `BUILDOS`, `BUILDARCH`, `TARGETPLATFORM`, `TARGETOS`, `TARGETARCH`, `TARGETVARIANT`.
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+ARG TARGETOS TARGETARCH
+WORKDIR /src
+COPY . .
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/app
+
+FROM scratch
+COPY --from=build /out/app /app
+ENTRYPOINT ["/app"]
+```
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t user/app:1.0 --push .
+```
+
+### COPY --link and Named Contexts
+
+```dockerfile
+# --link: layer does not depend on previous layers → better cache + parallelism
+COPY --link --chown=1000:1000 . /app
+
+# Named build contexts
+FROM base AS build
+COPY --from=config /etc/app.conf /etc/app.conf
+```
+
+```bash
+docker buildx build --build-context config=./config .
+```
+
+### Build Checks (Linter)
+
+```dockerfile
+# check=error=true
+```
+
+```bash
+docker build --check .
+```
+
+Catches mistakes like undefined variables, invalid stages, and deprecated syntax, with suggestions. See [Build checks](https://docs.docker.com/build/checks/).
+
+### Attestations
+
+```bash
+docker buildx build --sbom=true --provenance=true -t user/app:1.0 --push .
+docker buildx imagetools inspect user/app:1.0
+```
+
+See [Build attestations](https://docs.docker.com/build/attestations/).
+
+### Declarative Builds with `buildx bake`
+
+```hcl
+# docker-bake.hcl
+target "app" {
+  context = "."
+  tags    = ["user/app:1.0"]
+  platforms = ["linux/amd64", "linux/arm64"]
+}
+```
+
+```bash
+docker buildx bake
 ```
 
 ## Common Examples
 
-### Node.js Application
+### Node.js (production, multi-stage)
 
 ```dockerfile
-# Use official Node.js image
-FROM node:18-alpine
+# syntax=docker/dockerfile:1
 
-# Set working directory
+FROM node:24-alpine AS build
 WORKDIR /app
-
-# Copy package files
-COPY package*.json ./
-
-# Install dependencies
-RUN npm ci --only=production
-
-# Copy application code
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
 COPY . .
-
-# Create non-root user
-RUN adduser -D appuser
-USER appuser
-
-# Expose port
-EXPOSE 3000
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
-
-# Start application
-CMD ["npm", "start"]
-```
-
-### Python Application
-
-```dockerfile
-# Use official Python image
-FROM python:3.11-slim
-
-# Set working directory
-WORKDIR /app
-
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-# Install system dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        gcc \
-        && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
-COPY . .
-
-# Create non-root user
-RUN adduser --disabled-password --gecos '' appuser
-USER appuser
-
-# Expose port
-EXPOSE 8000
-
-# Start application
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "app:app"]
-```
-
-### Go Application
-
-```dockerfile
-# Build stage
-FROM golang:1.21-alpine AS builder
-
-WORKDIR /app
-
-# Copy go mod files
-COPY go.mod go.sum ./
-
-# Download dependencies
-RUN go mod download
-
-# Copy source code
-COPY . .
-
-# Build application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
-
-# Production stage
-FROM alpine:latest
-
-# Install ca-certificates for HTTPS
-RUN apk --no-cache add ca-certificates
-
-WORKDIR /root/
-
-# Copy binary from builder stage
-COPY --from=builder /app/main .
-
-# Expose port
-EXPOSE 8080
-
-# Run application
-CMD ["./main"]
-```
-
-### Multi-stage Build Example
-
-```dockerfile
-# Build stage
-FROM node:18 AS builder
-
-WORKDIR /app
-
-# Copy package files
-COPY package*.json ./
-
-# Install all dependencies (including dev)
-RUN npm ci
-
-# Copy source code
-COPY . .
-
-# Build application
 RUN npm run build
 
-# Production stage
-FROM node:18-alpine
-
+FROM node:24-alpine AS runtime
+ENV NODE_ENV=production
 WORKDIR /app
-
-# Copy package files
-COPY package*.json ./
-
-# Install only production dependencies
-RUN npm ci --only=production && npm cache clean --force
-
-# Copy built application from builder stage
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/public ./public
-
-# Create non-root user
-RUN addgroup -g 1001 -S nodejs
-RUN adduser -S nextjs -u 1001
-
-# Change ownership
-RUN chown -R nextjs:nodejs /app
-USER nextjs
-
-# Expose port
+RUN addgroup -S -g 1001 app && adduser -S -u 1001 -G app app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
+COPY --from=build /app/dist ./dist
+USER app
 EXPOSE 3000
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3000/api/health || exit 1
-
-# Start application
-CMD ["npm", "start"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:3000/health || exit 1
+CMD ["node", "dist/server.js"]
 ```
 
-## Quick Reference
-
-### Instruction Order (Best Practice)
-1. `FROM` - Base image
-2. `ARG` - Build arguments
-3. `ENV` - Environment variables
-4. `RUN` - Install dependencies
-5. `COPY` - Copy application files
-6. `WORKDIR` - Set working directory
-7. `USER` - Set user (if not root)
-8. `EXPOSE` - Document ports
-9. `HEALTHCHECK` - Health check
-10. `CMD` or `ENTRYPOINT` - Start command
-
-### Common Patterns
+### Python (production, virtualenv)
 
 ```dockerfile
-# Development Dockerfile
-FROM node:18
+# syntax=docker/dockerfile:1
+
+FROM python:3.13-slim AS build
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
-COPY package*.json ./
+RUN python -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+
+FROM python:3.13-slim AS runtime
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH="/venv/bin:$PATH"
+RUN groupadd --system --gid 1001 app \
+ && useradd --system --uid 1001 --gid app app
+WORKDIR /app
+COPY --from=build /venv /venv
+COPY --chown=app:app . .
+USER app
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')" || exit 1
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "app:app"]
+```
+
+### Go (scratch, multi-arch)
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+ARG TARGETOS TARGETARCH
+WORKDIR /src
+RUN apk add --no-cache ca-certificates
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/app
+
+FROM scratch
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /out/app /app
+USER 65534:65534
+EXPOSE 8080
+ENTRYPOINT ["/app"]
+```
+
+### Java (Maven multi-stage)
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+FROM eclipse-temurin:21-jdk-alpine AS build
+WORKDIR /workspace
+COPY .mvn .mvn
+COPY mvnw pom.xml ./
+RUN --mount=type=cache,target=/root/.m2 ./mvnw -B dependency:go-offline
+COPY src src
+RUN --mount=type=cache,target=/root/.m2 ./mvnw -B package -DskipTests
+
+FROM eclipse-temurin:21-jre-alpine
+RUN addgroup -S -g 1001 app && adduser -S -u 1001 -G app app
+WORKDIR /app
+COPY --from=build --chown=app:app /workspace/target/*.jar app.jar
+USER app
+EXPOSE 8080
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "/app/app.jar"]
+```
+
+### Static Site (build then nginx)
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+FROM node:24-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY . .
+RUN npm run build
+
+FROM nginx:1.28-alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80
+```
+
+### Development Dockerfile (with Compose override)
+
+```dockerfile
+FROM node:24-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
 RUN npm install
 COPY . .
 EXPOSE 3000
 CMD ["npm", "run", "dev"]
-
-# Production Dockerfile
-FROM node:18-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production
-COPY . .
-RUN adduser -D appuser
-USER appuser
-EXPOSE 3000
-CMD ["npm", "start"]
 ```
 
-## 2024-2025 Updates
+## Instruction Quick Reference
 
-### Latest Best Practices
-```dockerfile
-# Use specific base image versions
-FROM node:18.17.0-alpine
+| Instruction | Purpose | Notes |
+|-------------|---------|-------|
+| `FROM` | Base image / stage | Must be first (after `ARG`) |
+| `RUN` | Execute at build time | Combine commands; one layer each |
+| `CMD` | Default command/args | Overridden by `docker run` args |
+| `ENTRYPOINT` | Fixed executable | Override with `--entrypoint` |
+| `COPY` | Copy from context/stage | Preferred over `ADD` |
+| `ADD` | Copy + tar extract + URL | Use only when needed |
+| `WORKDIR` | Set working directory | Creates the directory |
+| `ENV` | Persistent env var | Visible in `docker inspect` |
+| `ARG` | Build-time variable | Visible in image history |
+| `EXPOSE` | Document ports | Metadata only |
+| `USER` | Runtime user | Prefer non-root |
+| `VOLUME` | Declare a mount point | Changes after it are discarded |
+| `LABEL` | Image metadata | Use OCI labels |
+| `HEALTHCHECK` | Container health check | `NONE` to disable |
+| `SHELL` | Change build shell | Affects shell-form `RUN`/`CMD` |
+| `STOPSIGNAL` | Signal for `docker stop` | e.g. `SIGQUIT` |
+| `ONBUILD` | Trigger in child builds | Prefer multi-stage |
+| `MAINTAINER` | Deprecated | Use OCI labels |
 
-# Implement non-root user from the start
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nextjs -u 1001
+## Common Anti-Patterns
 
-# Use BuildKit cache mounts
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci --only=production
+| Anti-pattern | Better approach |
+|--------------|-----------------|
+| `FROM image:latest` | Pin a version or digest |
+| `RUN apt-get upgrade` | Rebuild from an updated base instead |
+| Separate `apt-get update` and `install` | Same `RUN` to avoid stale caches |
+| `COPY . .` before installing deps | Copy lockfiles first, install, then copy source |
+| Secrets via `ENV`/`ARG`/`COPY` | `RUN --mount=type=secret` |
+| Running as root | Create a user and `USER app` |
+| Installing build tools in the final image | Multi-stage builds |
+| `ADD` for local copies / URL downloads | `COPY` or `RUN curl` with checksums |
+| `VOLUME /app` in app images | Mount at runtime via Compose/`docker run` |
+| Shell-form `CMD` for servers | Exec form (signals/PID 1) |
+| No `.dockerignore` | Add one (`.git`, `node_modules`, `.env`) |
+| Multiple `RUN` per package | Combine to reduce layers |
+| Changing `WORKDIR` with `RUN cd` | Use `WORKDIR` |
+| Huge images from cache files | Clean caches in the same layer or use cache mounts |
 
-# Implement health checks
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
+## What's New (2024–2026)
 
-# Use multi-platform builds
-FROM --platform=$BUILDPLATFORM node:18-alpine AS builder
-```
+- **BuildKit is the default** — `DOCKER_BUILDKIT=1` is obsolete; `--mount`/heredocs work out of the box.
+- **`COPY --link`** — layer-independent copies for better cache reuse and parallelism.
+- **`COPY --exclude`** — exclude paths from `COPY`/`ADD` without `.dockerignore` adjustments (frontend 1.19+).
+- **Heredocs** — multi-line `RUN`/`COPY` without shell escaping.
+- **Build checks** — `docker build --check` lints Dockerfiles and suggests fixes; `# check=error=true` makes warnings fail the build.
+- **Attestations** — `--sbom=true --provenance=true` attach verifiable metadata to pushed images.
+- **Docker Scout** — `docker scout cves` replaced the retired `docker scan`.
+- **Multi-platform everywhere** — `$BUILDPLATFORM`/`$TARGETARCH` cross-compilation patterns are standard.
+- **Minimal bases** — Distroless, `chainguard` images, and `scratch` are common production choices.
+- **Frontend versioning** — `# syntax=docker/dockerfile:1` tracks the latest stable 1.x; pin for reproducibility.
 
-### Security Enhancements
-```dockerfile
-# Use distroless images for production
-FROM gcr.io/distroless/nodejs18-debian11
+## References
 
-# Implement proper secret management
-RUN --mount=type=secret,id=npm_token \
-    npm config set //registry.npmjs.org/:_authToken $(cat /run/secrets/npm_token)
-
-# Use .dockerignore for security
-# .dockerignore
-node_modules
-.git
-.env
-*.log
-```
-
-### Performance Optimizations
-```dockerfile
-# Use BuildKit features
-# syntax=docker/dockerfile:1.4
-
-# Cache mount for package managers
-RUN --mount=type=cache,target=/var/cache/apt \
-    apt-get update && apt-get install -y curl
-
-# Parallel builds
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci --only=production
-```
+- [Dockerfile reference](https://docs.docker.com/reference/dockerfile/) — official instruction grammar
+- [Dockerfile best practices](https://docs.docker.com/build/building/best-practices/) — official guide
+- [Building with BuildKit](https://docs.docker.com/build/buildkit/)
+- [Build checks](https://docs.docker.com/build/checks/) — Dockerfile linter and `--check`
+- [Build secrets](https://docs.docker.com/build/building/secrets/)
+- [Multi-platform builds](https://docs.docker.com/build/building/multi-platform/)
+- [Build cache optimization](https://docs.docker.com/build/cache/optimize/)
+- [Build attestations](https://docs.docker.com/build/attestations/) — SBOM and provenance
+- [docker buildx bake](https://docs.docker.com/build/bake/)
+- [Frontend releases (docker/dockerfile)](https://github.com/docker/dockerfile/releases) — heredoc, `--link`, `--exclude`, checks
+- [OCI image annotations](https://github.com/opencontainers/image-spec/blob/main/annotations.md) — standard `org.opencontainers.image.*` labels
+- [Distroless images](https://github.com/GoogleContainerTools/distroless)
+- [Hadolint](https://github.com/hadolint/hadolint) — alternative Dockerfile linter
+- [dive](https://github.com/wagoodman/dive) — inspect layers and image size
+- [docker/awesome-compose](https://github.com/docker/awesome-compose) — real-world Dockerfile/Compose examples
 
 ---
 
-**Note**: This cheatsheet covers the most commonly used Dockerfile instructions with the latest 2024-2025 best practices. For more advanced usage, refer to the [official Docker documentation](https://docs.docker.com/engine/reference/builder/).
+**Note**: Covers Dockerfile syntax and BuildKit features for Docker Engine 28+. For the full grammar see the [Dockerfile reference](https://docs.docker.com/reference/dockerfile/).
